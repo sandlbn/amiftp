@@ -116,5 +116,9 @@ enum {
     MG_Page2, MG_SpeedBar,
     NumGadgets_main
   };
-
+void TransferTask(void);
+void StartTransferTask(void);
+void StopTransferTask(void);
+void AsyncGetFile(char *remoteFile, char *localFile, int size);
+void HandleTransferCompletion(int result, char *localFile);
 /* EOF */

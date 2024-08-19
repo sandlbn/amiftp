@@ -25,212 +25,218 @@ struct Gadget *TG_List[NumGadgets_TG];
 ULONG fuelargs[]={0,0};
 static int OverwriteAll=0;
 
-int DownloadFile(struct List *flist, const char *localname, const int binary,
-		 const int move)
-{
-    ULONG wait,signal,mainsignal,done=FALSE;
-    int result=1;
+static int pendingTransfers = 0;
+struct TransferRequest {
+    struct Message msg;       // AmigaOS message structure
+    char *remoteFile;         // Remote file path
+    char *localFile;          // Local file path
+    int fileSize;             // Size of the file to transfer
+};
+
+// Global variables for task and message port
+struct MsgPort *transferPort = NULL;
+struct Process *transferTask = NULL;
+
+
+struct TransferResult {
+    struct Message msg;
+    int resultCode;           // Result of the transfer (e.g., TRANS_OK, TRANS_ABORTED)
+    char localFile[MAXPATHLEN + 1];  // The local file that was transferred
+};
+// TransferTask: The task that handles file transfers
+void TransferTask(void) {
+    struct TransferRequest *request;
+    BOOL done = FALSE;
+
+    while (!done) {
+        WaitPort(transferPort);
+        while ((request = (struct TransferRequest *)GetMsg(transferPort))) {
+            // Perform the file transfer operation
+            int result = recvrequest("RETR", request->localFile, request->remoteFile, "w", 0);
+
+            // Prepare the result message
+            struct TransferResult *transferResult = AllocMem(sizeof(struct TransferResult), MEMF_CLEAR);
+            if (transferResult) {
+                transferResult->msg.mn_Length = sizeof(struct TransferResult);
+                transferResult->resultCode = result;
+                strcpy(transferResult->localFile, request->localFile);
+
+                // Send the result back to the main thread
+                PutMsg(request->msg.mn_ReplyPort, &transferResult->msg);
+            }
+
+            // Free the request memory
+            FreeMem(request, sizeof(struct TransferRequest));
+        }
+    }
+}
+
+// StartTransferTask: Initializes and starts the file transfer task
+void StartTransferTask(void) {
+    transferPort = CreatePort(NULL, 0);  // Create a message port
+    if (transferPort) {
+        transferTask = CreateNewProcTags(
+            NP_Entry, TransferTask, 
+            NP_Name, "TransferTask", 
+            NP_Priority, 0, 
+            NP_StackSize, 8192, 
+            TAG_END
+        );
+    }
+}
+
+// clean and stop
+void StopTransferTask(void) {
+    if (transferTask) {
+
+        DeletePort(transferPort);
+        transferPort = NULL;
+    }
+}
+
+void AsyncGetFile(char *remoteFile, char *localFile, int size) {
+    if (!transferPort) {
+        StartTransferTask();  // Ensure the transfer task is running
+    }
+
+    // Allocate memory for the transfer request
+    struct TransferRequest *request = AllocMem(sizeof(struct TransferRequest), MEMF_CLEAR);
+    if (request) {
+        request->msg.mn_Length = sizeof(struct TransferRequest);
+        request->msg.mn_ReplyPort = resultPort;  // Set reply port for the message
+        request->remoteFile = strdup(remoteFile);  // Copy remote file path
+        request->localFile = strdup(localFile);    // Copy local file path
+        request->fileSize = size;                  // Set the file size
+
+        // inc transfer
+        pendingTransfers++;
+
+        // Send the message to the transfer task
+        PutMsg(transferPort, &request->msg);
+    }
+}
+
+// HandleTransferCompletion: Handles the result of a file transfer
+void HandleTransferCompletion(int result, char *localFile) {
+    if (result == TRSF_OK) {
+        Printf("File %s transferred successfully.\n", localFile);
+    } else if (result == TRSF_ABORTED) {
+        Printf("File transfer aborted for %s.\n", localFile);
+    } else {
+        Printf("Error transferring file %s.\n", localFile);
+    }
+}
+
+void HandleTransferResults(void) {
+    struct TransferResult *resultMsg;
+
+    while ((resultMsg = (struct TransferResult *)GetMsg(resultPort))) {
+        // Handle the result
+        if (resultMsg->resultCode == TRANS_OK) {
+            Printf("File %s transferred successfully.\n", resultMsg->localFile);
+        } else if (resultMsg->resultCode == TRANS_ABORTED) {
+            Printf("File transfer aborted for %s.\n", resultMsg->localFile);
+        } else {
+            Printf("Error transferring file %s.\n", resultMsg->localFile);
+        }
+
+        pendingTransfers--;
+
+        if (pendingTransfers == 0) {
+            // Clean up
+            if (TransferWindow) {
+                CloseTransferWindow();  // Close the transfer window
+                TransferWindow = NULL;  // Reset the window pointer
+            }
+
+            UpdateMainButtons(MB_NONESELECTED);
+            UpdateWindowTitle();
+        }
+
+        FreeMem(resultMsg, sizeof(struct TransferResult));
+    }
+}
+
+int DownloadFile(struct List *flist, const char *localname, const int binary, const int move) {
+    ULONG wait, signal, mainsignal, done = FALSE;
     struct dirlist *curr;
     struct Node *node;
-    char localfile[MAXPATHLEN+1];
-    BOOL aborted=FALSE;
+    BOOL aborted = FALSE;
 
     settype(binary);
-    fuelargs[0]=fuelargs[1]=0;
-    OverwriteAll=0;
+    fuelargs[0] = fuelargs[1] = 0;
+    OverwriteAll = 0;
 
-    if (MainWindow)
-      if (!OpenTransferWindow())
-	return TRANS_GUI;
-
-    for (node=ListHead(flist);ListEnd(node);node=ListNext(node)) {
-	ULONG sel=0;
-	GetListBrowserNodeAttrs(node, LBNA_Selected, &sel, TAG_DONE);
-	if (sel) {
-	    static char tmp[1024];
-	    curr=(void *)node->ln_Name;
-	    aborted=0;
-	    UpdateTransTitle(node);
-	    switch(curr->mode & S_IFMT) {
-	      case S_IFDIR:
-		if (AskGetDir()) {
-		    if (result=GetDir(CurrentState.CurrentRemoteDir,
-					  CurrentState.CurrentDLDir,curr->name,
-					  curr->name)) {
-			goto out;
-		    }
-		    if (result==TRSF_OK) {
-			if (flist==FileList)
-			  LBEditNode(MG_List[MG_ListView],MainWindow,NULL,
-				     node,LBNA_Selected,FALSE,TAG_DONE);
-			else
-			  SetListBrowserNodeAttrs(node, LBNA_Selected, FALSE,
-						  TAG_DONE);
-		    }
-
-		}
-		break;
-	      case S_IFREG:
-		memset(localfile,0,sizeof(localfile));
-		if (!localname) {
-		    stcgfn(tmp,curr->name);
-		    strmfp(localfile,CurrentState.CurrentDLDir,tmp);
-		}
-		else {
-		    if (localname[strlen(localname)-1]=='/'||localname[strlen(localname)-1]==':') {
-			strcpy(localfile,localname);
-			stcgfn(localfile+strlen(localfile),curr->name);
-		    }
-		    else {
-			if (getfa(localname)==1) {
-			    strcpy(localfile,localname);
-			    strcat(localfile,"/");
-			    stcgfn(localfile+strlen(localfile),curr->name);
-			}
-			else {
-			    if (index(localname,'/')||index(localname,':'))
-			      strcpy(localfile,localname);
-			    else
-			      strmfp(localfile,CurrentState.CurrentDLDir,localname);
-			}
-		    }
-		}
-		if (curr->adt) {
-		    char aname[35];
-		    sprintf(aname,"%s/%s",curr->owner,curr->name);
-		    result=get_file(aname, localfile, curr->size);
-		    if (result==TRSF_OK && MainPrefs.mp_GetReadme) {
-			char *readme=NameToReadme(curr->name, curr->readmelength);
-			char lname[64];
-			sprintf(aname, "%s/%s", curr->owner, readme);
-			strmfp(lname, CurrentState.CurrentDLDir, readme);
-			result=get_file(aname, lname, curr->readmelen);
-		    }
-		}
-		else {
-		    result=get_file(curr->name, localfile, curr->size);
-		}
-		if (result==TRSF_OK) {
-		    if (flist==FileList)
-		      LBEditNode(MG_List[MG_ListView], MainWindow, NULL,
-				 node, LBNA_Selected, FALSE, TAG_DONE);
-		    else
-		      SetListBrowserNodeAttrs(node, LBNA_Selected, FALSE, TAG_DONE);
-		 }
-		else if (result==TRSF_ABORTED)
-		  goto out;
-		break;
-	      case S_IFLNK:
-		{
-		    char *name;
-		    name=linkname(curr->name);
-		    if (name) {
-			memset(localfile,0,sizeof(localfile));
-			if (!localname) {
-			    stcgfn(tmp,name);
-			    strmfp(localfile, CurrentState.CurrentDLDir, tmp);
-			}
-			else {
-			    if (localname[strlen(localname)-1]=='/'||
-				localname[strlen(localname)-1]==':') {
-				strcpy(localfile, localname);
-				stcgfn(localfile+strlen(localfile), name);
-			    }
-			    else {
-				if (getfa(localname)==1) {
-				    strcpy(localfile, localname);
-				    strcat(localfile,"/");
-				    stcgfn(localfile+strlen(localfile), name);
-				}
-				else {
-				    if (index(localname, '/') ||
-					index(localname, ':'))
-				      strcpy(localfile, localname);
-				    else
-				      strmfp(localfile, CurrentState.CurrentDLDir,
-					     localname);
-				}
-			    }
-			}
-			result=get_file(name, localfile, curr->size);
-			if (result==TRSF_BADFILE) {
-			    if (AskGetDir()) {
-				if (result==GetDir(CurrentState.CurrentRemoteDir,CurrentState.CurrentDLDir,name,name)!=TRSF_OK) {
-				    free(name);
-				    goto out;
-				}
-			    }
-			    if (flist==FileList)
-			      LBEditNode(MG_List[MG_ListView], MainWindow, NULL,
-					 node, LBNA_Selected, FALSE, TAG_DONE);
-			    else
-			      SetListBrowserNodeAttrs(node, LBNA_Selected, FALSE,
-						      TAG_DONE);
-			}
-			else if (result==TRSF_OK) {
-			    if (flist==FileList)
-			      LBEditNode(MG_List[MG_ListView], MainWindow, NULL,
-					 node, LBNA_Selected, FALSE, TAG_DONE);
-			    else
-			      SetListBrowserNodeAttrs(node, LBNA_Selected, FALSE,
-						      TAG_DONE);
-			}
-			else if (result==TRSF_ABORTED)
-			  goto out;
-			free(name);
-		    }
-		}
-		break;
-	    }
-	}
-    }
-    UpdateTransTitle(0);
-    for (node=ListHead(flist);ListEnd(node);node=ListNext(node)) {
-	ULONG t=0;
-	GetListBrowserNodeAttrs(node, LBNA_Selected, &t, TAG_DONE);
-	if (t) {
-	    break;
-	}
-    }
-    if (node==0 && flist==FileList) {
-	UpdateMainButtons(MB_NONESELECTED);
-    }
-    UpdateWindowTitle();
-  out:
-    if (result==TRSF_OK || result==TRSF_ABORTED) {
-	if (result==TRSF_OK && MainPrefs.mp_DisplayBeep && TransferWindow) {
-	    DisplayBeep(Screen);
-	}
-	if (TransferWindow)
-	  CloseTransferWindow();
-	return result==TRSF_OK?TRANS_OK:TRANS_ABORTED;
+    if (MainWindow) {
+        if (!OpenTransferWindow()) {
+            return TRANS_GUI;
+        }
     }
 
-    if (TransferWin_Object) {
-	GetAttr(WINDOW_SigMask, TransferWin_Object, &signal);
+    for (node = ListHead(flist); ListEnd(node); node = ListNext(node)) {
+        ULONG sel = 0;
+        GetListBrowserNodeAttrs(node, LBNA_Selected, &sel, TAG_DONE);
+        if (sel) {
+            static char tmp[1024];
+            curr = (void *)node->ln_Name;
+            aborted = 0;
+            UpdateTransTitle(node);
 
-	SetGadgetAttrs(TG_List[TG_Abort], TransferWindow,NULL,
-		       GA_Disabled, TRUE,
-		       TAG_DONE);
-	RefreshGList(TG_List[TG_Abort], TransferWindow, NULL,1);
+            switch (curr->mode & S_IFMT) {
+                case S_IFDIR:
+                    if (AskGetDir()) {
+                        result = GetDir(CurrentState.CurrentRemoteDir, CurrentState.CurrentDLDir, curr->name, curr->name);
+                        if (result == TRSF_OK) {
+                            if (flist == FileList) {
+                                LBEditNode(MG_List[MG_ListView], MainWindow, NULL, node, LBNA_Selected, FALSE, TAG_DONE);
+                            } else {
+                                SetListBrowserNodeAttrs(node, LBNA_Selected, FALSE, TAG_DONE);
+                            }
+                        }
+                    }
+                    break;
 
-	if (!SilentMode) {
-	    while (!done) {
-		GetAttr(WINDOW_SigMask, MainWin_Object, &mainsignal);
-		wait=Wait(signal|AG_Signal|mainsignal);
-		if (wait & AG_Signal)
-		  HandleAmigaGuide();
-		if (wait & signal)
-		  done=HandleTransferIDCMP();
-		if (wait & mainsignal)
-		  HandleMainWindowIDCMP(FALSE);
-	    }
-	}
-	
-	CloseTransferWindow();
+                case S_IFREG:
+                    // Prepare local file path
+                    memset(tmp, 0, sizeof(tmp));
+                    PrepareLocalFilePath(curr->name, localname, tmp, localfile);
+                    AsyncGetFile(curr->name, localfile, curr->size);
+
+                    // Deselect the file in the list view
+                    if (flist == FileList) {
+                        LBEditNode(MG_List[MG_ListView], MainWindow, NULL, node, LBNA_Selected, FALSE, TAG_DONE);
+                    } else {
+                        SetListBrowserNodeAttrs(node, LBNA_Selected, FALSE, TAG_DONE);
+                    }
+                    break;
+
+                case S_IFLNK: {
+                    char *name = linkname(curr->name);
+                    if (name) {
+                        PrepareLocalFilePath(name, localname, tmp, localfile);
+                        AsyncGetFile(name, localfile, curr->size);
+                        free(name);
+                    }
+                    break;
+                }
+            }
+        }
     }
-    return TRANS_ERROR;
+
+    // Now wait for all transfer results and handle them
+    while (/* condition to check if all transfers are complete */) {
+        HandleTransferResults();  // Process the result messages
+        Delay(10);  // Slight delay to yield the processor
+    }
+
+    // Clean up UI and close the transfer window if necessary
+    if (TransferWindow) {
+        CloseTransferWindow();
+    }
+
+    return TRANS_OK;  // Return the appropriate result after all transfers are handled
 }
+
 
 ULONG HandleTransferIDCMP(void)
 {
